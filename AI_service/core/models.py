@@ -1,310 +1,268 @@
 from django.db import models
-from django.contrib.auth import get_user_model
 from django.utils import timezone
 import uuid
 
-User = get_user_model()
-
-
 # ──────────────────────────────────────────────────────────────────────────────
-# 0. Broker Accounts & Alert Channels
+# 1. Users & Subscriptions
 # ──────────────────────────────────────────────────────────────────────────────
 
-class BrokerAccount(models.Model):
-    """Represents a user’s connection to a broker (e.g. MT4, MT5)."""
-    BROKER_CHOICES = [
-        ('MT4', 'MetaTrader 4'),
-        ('MT5', 'MetaTrader 5'),
-        ('OTHER', 'Other'),
+class TelegramUser(models.Model):
+    """Represents a user of the bot, identified by their Telegram account."""
+    telegram_id       = models.BigIntegerField(unique=True, db_index=True)
+    username          = models.CharField(max_length=64, blank=True)
+    device_fingerprint= models.CharField(max_length=256, blank=True)
+    last_ip           = models.GenericIPAddressField(null=True, blank=True)
+    created_at        = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.username or self.telegram_id}"
+
+
+class Subscription(models.Model):
+    """Tracks free trials, payments, referrals, and active periods."""
+    STATUS_CHOICES = [
+        ('TRIAL',   'Trial'),
+        ('ACTIVE',  'Active'),
+        ('EXPIRED', 'Expired'),
+        ('CANCELED','Canceled'),
     ]
-    user            = models.ForeignKey(User, on_delete=models.CASCADE, related_name='broker_accounts')
-    name            = models.CharField(max_length=100)  # e.g. "Live Account", "Demo #1"
-    broker          = models.CharField(max_length=10, choices=BROKER_CHOICES)
-    account_id      = models.CharField(max_length=100)  # broker-specific identifier
-    is_default      = models.BooleanField(default=False)
-    credentials     = models.JSONField(blank=True, default=dict)  # connection info securely stored/encrypted elsewhere
-    created_at      = models.DateTimeField(auto_now_add=True)
-    updated_at      = models.DateTimeField(auto_now=True)
 
-    class Meta:
-        unique_together = [('user', 'name')]
-        indexes = [
-            models.Index(fields=['user', 'broker']),
-        ]
+    user              = models.OneToOneField(TelegramUser, on_delete=models.CASCADE)
+    trial_start       = models.DateTimeField(default=timezone.now)
+    trial_end         = models.DateTimeField()
+    status            = models.CharField(max_length=10, choices=STATUS_CHOICES, default='TRIAL')
+    # Payment info
+    paystack_reference= models.CharField(max_length=128, blank=True)
+    payment_ip        = models.GenericIPAddressField(null=True, blank=True)
+    discount_applied  = models.BooleanField(default=False)  # true if paid within trial/grace
+    # Referral info
+    referral_code     = models.CharField(max_length=10, unique=True)
+    referred_by       = models.CharField(max_length=10, blank=True)
+    early_ref_count   = models.PositiveIntegerField(default=0)
+    subscription_end  = models.DateTimeField(null=True, blank=True)
+    # User preferences
+    mode              = models.CharField(max_length=10, default='moderate')  # conservative/moderate/aggressive
+    risk_pct          = models.FloatField(default=0.5)  # percent of equity per trade
+    # Device/IP lock for trial
+    trial_device      = models.CharField(max_length=256, blank=True)
+    trial_ip          = models.GenericIPAddressField(null=True, blank=True)
 
-
-class AlertChannel(models.Model):
-    """Defines where to send alerts (email, webhook, etc.)."""
-    CHANNEL_TYPES = [
-        ('EMAIL', 'Email'),
-        ('WEBHOOK', 'Webhook'),
-        ('SLACK', 'Slack'),
-        # add more as needed
-    ]
-    user            = models.ForeignKey(User, on_delete=models.CASCADE, related_name='alert_channels')
-    channel_type    = models.CharField(max_length=20, choices=CHANNEL_TYPES)
-    config          = models.JSONField(default=dict, blank=True)  # e.g. { "email": "...@..." } or webhook URL
-    is_primary      = models.BooleanField(default=False)
-    created_at      = models.DateTimeField(auto_now_add=True)
-    updated_at      = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        unique_together = [('user', 'channel_type', 'config')]
+    def __str__(self):
+        return f"{self.user} → {self.status}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 1. Signal ingestion & multi-modal parsing
+# 2. Signal Source & Quality Tracking
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TelegramSource(models.Model):
-    name             = models.CharField(max_length=100, unique=True)
-    reputation_score = models.FloatField(default=50.0)
-    created_at       = models.DateTimeField(auto_now_add=True)
-    updated_at       = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        indexes = [models.Index(fields=['-reputation_score'])]
-
-
-class RawMessage(models.Model):
-    source      = models.ForeignKey(TelegramSource, on_delete=models.CASCADE)
-    telegram_id = models.CharField(max_length=64, unique=True)
-    text        = models.TextField()
-    image       = models.ImageField(null=True, blank=True)
-    ocr_text    = models.TextField(null=True, blank=True)
-    ingested_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        indexes = [models.Index(fields=['-ingested_at'])]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. Standardized Signal object & consensus/conflict logic
-# ──────────────────────────────────────────────────────────────────────────────
-
-class Signal(models.Model):
-    id                = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    raw_message       = models.ForeignKey(RawMessage, on_delete=models.CASCADE)
-    asset             = models.CharField(max_length=20, db_index=True)
-    action            = models.CharField(max_length=10)
-    trade_type        = models.CharField(max_length=20)
-    entry_price       = models.FloatField()
-    entry_range_min   = models.FloatField(null=True, blank=True)
-    entry_range_max   = models.FloatField(null=True, blank=True)
-    target_price      = models.FloatField()
-    target_levels     = models.JSONField(default=list, blank=True)
-    stop_loss         = models.FloatField()
-    risk_reward       = models.CharField(max_length=10)
-    timeframe         = models.CharField(max_length=10)
-    confidence        = models.FloatField(db_index=True)
-    score             = models.FloatField(db_index=True)
-    is_consensus      = models.BooleanField(default=False, db_index=True)
-    conflict_with     = models.ForeignKey(
-        'self', null=True, blank=True, on_delete=models.SET_NULL,
-        related_name='conflicted_signals'
-    )
-    reason            = models.TextField()
-    exit_origin       = models.CharField(
-        max_length=20,
-        choices=[('EXPLICIT','Explicit'),('INFERRED','Inferred'),('UPDATED','Updated')],
-        default='EXPLICIT'
-    )
-    timestamp_utc     = models.DateTimeField(db_index=True)
-    expires_at_utc    = models.DateTimeField(db_index=True)
+    """A Telegram group/channel we monitor for signals."""
+    chat_id           = models.BigIntegerField(unique=True, db_index=True)
+    title             = models.CharField(max_length=200)
+    reputation        = models.FloatField(default=50.0)    # aggregated from backtests & feedback
+    message_count     = models.PositiveIntegerField(default=0)
+    signal_count      = models.PositiveIntegerField(default=0)
+    last_quality      = models.FloatField(default=0.0)     # signal_count/message_count
     created_at        = models.DateTimeField(auto_now_add=True)
     updated_at        = models.DateTimeField(auto_now=True)
 
     class Meta:
-        ordering = ['-timestamp_utc']
-        indexes = [
-            models.Index(fields=['asset', 'action', 'timestamp_utc']),
-            models.Index(fields=['-score']),
-        ]
+        ordering = ['-reputation']
+
+    def __str__(self):
+        return self.title
 
 
-class SignalSource(models.Model):
-    signal            = models.ForeignKey(Signal, on_delete=models.CASCADE, related_name='sources')
+# ──────────────────────────────────────────────────────────────────────────────
+# 3. Raw Messages & Parsed Signals
+# ──────────────────────────────────────────────────────────────────────────────
+
+class RawMessage(models.Model):
+    """Every raw Telegram message + OCR text for audit and reprocessing."""
     source            = models.ForeignKey(TelegramSource, on_delete=models.CASCADE)
-    source_confidence = models.FloatField()
-    reputation_at_time= models.FloatField()
+    telegram_msg_id   = models.CharField(max_length=64, unique=True)
+    text              = models.TextField()
+    image             = models.ImageField(null=True, blank=True)
+    ocr_text          = models.TextField(null=True, blank=True)
+    received_at       = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.source}#{self.telegram_msg_id}"
+
+
+class Signal(models.Model):
+    """A fully parsed, provider-style trading signal."""
+    EXIT_ORIGINS = [
+        ('EXPLICIT','Explicit'),
+        ('INFERRED','Inferred'),
+        ('UPDATED','Updated'),
+    ]
+
+    id                = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    raw_message       = models.ForeignKey(RawMessage, on_delete=models.CASCADE)
+    asset             = models.CharField(max_length=20, db_index=True)  # e.g. BTC, ETH
+    action            = models.CharField(max_length=10)                 # BUY, SELL, SHORT
+    entry_price       = models.FloatField()
+    stop_loss         = models.FloatField()
+    target_prices     = models.JSONField(default=list, blank=True)      # [TP1, TP2, …]
+    timeframe         = models.CharField(max_length=10)                 # 1H, 4H, Daily
+    trade_type        = models.CharField(max_length=20)                 # BREAKOUT, SCALP, SWING…
+    confidence        = models.FloatField(db_index=True)               # 0–100%
+    exit_origin       = models.CharField(max_length=10, choices=EXIT_ORIGINS, default='EXPLICIT')
+    is_conflict       = models.BooleanField(default=False)
+    conflict_winner   = models.BooleanField(null=True)                 # True if this signal won
+    conflict_reason   = models.TextField(blank=True)
+    reason            = models.TextField(blank=True)                   # one-line rationale
+    scored_at         = models.DateTimeField(auto_now_add=True)
+    timestamp_utc     = models.DateTimeField(db_index=True)
+    expires_at_utc    = models.DateTimeField(db_index=True)
+    dedup_key         = models.CharField(max_length=128, blank=True, db_index=True)
 
     class Meta:
-        unique_together = [('signal', 'source')]
+        ordering = ['-timestamp_utc']
+
+    def __str__(self):
+        return f"{self.asset} {self.action}@{self.entry_price}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 3. Subscription & personalization
-# ──────────────────────────────────────────────────────────────────────────────
-
-class Subscription(models.Model):
-    user               = models.ForeignKey(User, on_delete=models.CASCADE)
-    assets             = models.JSONField(default=list, blank=True)
-    sources_whitelist  = models.ManyToManyField(TelegramSource, blank=True, related_name='+')
-    sources_blacklist  = models.ManyToManyField(TelegramSource, blank=True, related_name='+')
-    trade_types        = models.JSONField(default=list, blank=True)
-    min_confidence     = models.FloatField(default=0.0)
-    require_consensus  = models.PositiveIntegerField(default=0)
-    alert_channels     = models.ManyToManyField(AlertChannel, blank=True)
-    updated_at         = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        unique_together = [('user',)]
-
-
-class Mode(models.Model):
-    name                = models.CharField(max_length=30, unique=True)
-    risk_per_trade      = models.FloatField()    # fraction of equity
-    size_modifier       = models.FloatField()
-    min_confidence      = models.FloatField()
-    require_explicit    = models.BooleanField()
-    flip_delta_required = models.FloatField()
-    streak_scaling      = models.BooleanField(default=False)
-    drawdown_safety     = models.FloatField(default=0.0)
-    created_at          = models.DateTimeField(auto_now_add=True)
-    updated_at          = models.DateTimeField(auto_now=True)
-
-
-class UserProfile(models.Model):
-    user              = models.OneToOneField(User, on_delete=models.CASCADE)
-    mode              = models.ForeignKey(Mode, on_delete=models.SET_NULL, null=True)
-    email_confirm     = models.BooleanField(default=True)
-    badge_preferences = models.JSONField(default=dict, blank=True)
-    ui_defaults       = models.JSONField(default=dict, blank=True)
-
-    class Meta:
-        indexes = [models.Index(fields=['user'])]
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. Risk rules & execution tracking
+# 4. Trade Orders & Execution Logging
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TradeOrder(models.Model):
-    signal              = models.OneToOneField(Signal, on_delete=models.SET_NULL, null=True, blank=True)
-    user                = models.ForeignKey(User, on_delete=models.CASCADE)
-    account             = models.ForeignKey(BrokerAccount, on_delete=models.CASCADE)
-    mode                = models.ForeignKey(Mode, on_delete=models.SET_NULL, null=True)
-    size                = models.FloatField()
-    expected_slippage   = models.FloatField(null=True, blank=True)
-    actual_slippage     = models.FloatField(null=True, blank=True)
-    slippage_cost       = models.FloatField(null=True, blank=True)
-    placed_at           = models.DateTimeField(null=True, blank=True)
-    executed_at         = models.DateTimeField(null=True, blank=True)
-    status              = models.CharField(
-        max_length=20,
-        choices=[('PENDING','Pending'),('EXECUTED','Executed'),('REJECTED','Rejected'),('FAILED','Failed')]
-    )
-    last_error          = models.TextField(null=True, blank=True)
-    profit_loss         = models.FloatField(null=True, blank=True)
-    created_at          = models.DateTimeField(auto_now_add=True)
-    updated_at          = models.DateTimeField(auto_now=True)
+    """An MT5 order placed (or pending) in response to a Signal."""
+    STATUS_CHOICES = [
+        ('PENDING','Pending'),
+        ('EXECUTED','Executed'),
+        ('REJECTED','Rejected'),
+        ('FAILED','Failed'),
+    ]
 
-    class Meta:
-        indexes = [
-            models.Index(fields=['user', 'status']),
-            models.Index(fields=['account', 'status']),
-        ]
+    user              = models.ForeignKey(TelegramUser, on_delete=models.CASCADE)
+    signal            = models.OneToOneField(Signal, on_delete=models.CASCADE)
+    size              = models.FloatField()   # lots or units
+    status            = models.CharField(max_length=10, choices=STATUS_CHOICES, default='PENDING')
+    expected_slippage = models.FloatField(null=True, blank=True)
+    actual_slippage   = models.FloatField(null=True, blank=True)
+    slippage_cost     = models.FloatField(null=True, blank=True)
+    placed_at         = models.DateTimeField(null=True, blank=True)
+    executed_at       = models.DateTimeField(null=True, blank=True)
+    profit_loss       = models.FloatField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Order[{self.status}] {self.signal}"
 
 
 class ExecutionAttempt(models.Model):
-    """Logs each attempt to execute or modify an order."""
-    trade_order     = models.ForeignKey(TradeOrder, on_delete=models.CASCADE, related_name='attempts')
-    attempt_number  = models.PositiveIntegerField(default=1)
-    request_payload = models.JSONField(default=dict, blank=True)
-    response_data   = models.JSONField(default=dict, blank=True)
-    duration_ms     = models.IntegerField(null=True, blank=True)
-    success         = models.BooleanField(default=False)
-    error_message   = models.TextField(null=True, blank=True)
-    created_at      = models.DateTimeField(auto_now_add=True)
+    """Detailed log of each API call for placing/modifying an order."""
+    trade_order       = models.ForeignKey(TradeOrder, on_delete=models.CASCADE, related_name='attempts')
+    attempt_number    = models.PositiveIntegerField()
+    request_payload   = models.JSONField(default=dict, blank=True)
+    response_data     = models.JSONField(default=dict, blank=True)
+    duration_ms       = models.IntegerField(null=True, blank=True)
+    success           = models.BooleanField(default=False)
+    error_message     = models.TextField(null=True, blank=True)
+    attempted_at      = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [('trade_order', 'attempt_number')]
-
-
-class AccountStatus(models.Model):
-    user            = models.ForeignKey(User, on_delete=models.CASCADE)
-    account         = models.ForeignKey(BrokerAccount, on_delete=models.CASCADE)
-    equity          = models.FloatField()
-    free_margin     = models.FloatField()
-    margin_level    = models.FloatField()
-    fetched_at      = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        get_latest_by = 'fetched_at'
-        indexes = [
-            models.Index(fields=['account', 'fetched_at']),
-        ]
+        unique_together = [('trade_order','attempt_number')]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 5. Feedback, backtest & reputation
+# 5. Feedback & Reputation
 # ──────────────────────────────────────────────────────────────────────────────
 
-class SignalFeedback(models.Model):
-    user             = models.ForeignKey(User, on_delete=models.CASCADE)
-    signal           = models.ForeignKey(Signal, on_delete=models.CASCADE, related_name='feedbacks')
-    useful           = models.BooleanField()
-    corrected_fields = models.JSONField(default=dict, blank=True)
-    created_at       = models.DateTimeField(auto_now_add=True)
+class Feedback(models.Model):
+    """User feedback on signals to refine reputation and NLP accuracy."""
+    user              = models.ForeignKey(TelegramUser, on_delete=models.CASCADE)
+    signal            = models.ForeignKey(Signal, on_delete=models.CASCADE, related_name='feedbacks')
+    useful            = models.BooleanField()
+    corrected_fields  = models.JSONField(default=dict, blank=True)
+    created_at        = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [
-            models.Index(fields=['signal', 'useful']),
-        ]
+        indexes = [models.Index(fields=['signal','useful'])]
 
 
 class BacktestResult(models.Model):
-    source           = models.ForeignKey(TelegramSource, on_delete=models.CASCADE)
-    account          = models.ForeignKey(BrokerAccount, on_delete=models.CASCADE)
-    start_date       = models.DateField()
-    end_date         = models.DateField()
-    hit_rate         = models.FloatField()
-    avg_risk_reward  = models.FloatField()
-    expectancy       = models.FloatField()
-    drawdown         = models.FloatField()
-    generated_at     = models.DateTimeField(auto_now_add=True)
+    """Aggregated performance metrics of a source over a time window."""
+    source            = models.ForeignKey(TelegramSource, on_delete=models.CASCADE)
+    period_start      = models.DateField()
+    period_end        = models.DateField()
+    hit_rate          = models.FloatField()
+    avg_risk_reward   = models.FloatField()
+    expectancy        = models.FloatField()
+    drawdown          = models.FloatField()
+    computed_at       = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [('source', 'account', 'start_date', 'end_date')]
+        unique_together = [('source','period_start','period_end')]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 6. Plugin Rules & Analytics
+# 6. Broadcasts & Summaries
 # ──────────────────────────────────────────────────────────────────────────────
 
-class CustomRule(models.Model):
-    """User-defined signal routing or alerting logic."""
-    RULE_TYPES = [
-        ('WEBHOOK', 'Webhook'),
-        ('EMAIL',   'Email'),
-        ('SLACK',   'Slack'),
+class Broadcast(models.Model):
+    """Custom messages you send to segments of users."""
+    TARGET_CHOICES = [
+        ('ALL',    'All Users'),
+        ('ACTIVE', 'Active Subscribers'),
+        ('TRIAL',  'Trial Users'),
+        ('EXPIRED','Expired'),
     ]
-    user            = models.ForeignKey(User, on_delete=models.CASCADE, related_name='custom_rules')
-    name            = models.CharField(max_length=100)
-    rule_type       = models.CharField(max_length=20, choices=RULE_TYPES)
-    definition      = models.JSONField()  # e.g. {"if": {...}, "then": {...}}
-    is_active       = models.BooleanField(default=True)
-    created_at      = models.DateTimeField(auto_now_add=True)
-    updated_at      = models.DateTimeField(auto_now=True)
+    sender           = models.ForeignKey(TelegramUser, on_delete=models.SET_NULL, null=True,
+                                         related_name='sent_broadcasts')
+    text             = models.TextField()
+    target_segment   = models.CharField(max_length=10, choices=TARGET_CHOICES, default='ALL')
+    created_at       = models.DateTimeField(auto_now_add=True)
+
+
+class SummaryReport(models.Model):
+    """AI-generated narrative summaries for a user and period."""
+    TONE_CHOICES = [
+        ('humorous','Humorous'),
+        ('serious',  'Serious'),
+    ]
+    user              = models.ForeignKey(TelegramUser, on_delete=models.CASCADE)
+    period_type       = models.CharField(max_length=10)       # day, week, month, quarter, year
+    period_start      = models.DateField()
+    period_end        = models.DateField()
+    tone              = models.CharField(max_length=10, choices=TONE_CHOICES)
+    summary_text      = models.TextField()
+    generated_at      = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [('user', 'name')]
+        ordering = ['-generated_at']
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 7. Analytics & Device Abuse Control
+# ──────────────────────────────────────────────────────────────────────────────
 
 class AnalyticsEvent(models.Model):
+    """Low-level events for monitoring latency, volumes, and errors."""
     EVENT_TYPES = [
         ('INGEST','Ingest'),('PARSE','Parse'),
         ('ALERT','Alert'),('EXEC','Execute'),
         ('FEEDBACK','Feedback'),
     ]
-    event_type  = models.CharField(max_length=20, choices=EVENT_TYPES)
-    signal      = models.ForeignKey(Signal, on_delete=models.SET_NULL, null=True, blank=True)
-    user        = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True)
-    duration_ms = models.IntegerField(null=True, blank=True)
-    metadata    = models.JSONField(default=dict, blank=True)
-    created_at  = models.DateTimeField(auto_now_add=True)
+    user              = models.ForeignKey(TelegramUser, on_delete=models.SET_NULL, null=True, blank=True)
+    signal            = models.ForeignKey(Signal, on_delete=models.SET_NULL, null=True, blank=True)
+    event_type        = models.CharField(max_length=10, choices=EVENT_TYPES)
+    duration_ms       = models.IntegerField(null=True, blank=True)
+    metadata          = models.JSONField(default=dict, blank=True)
+    created_at        = models.DateTimeField(auto_now_add=True)
+
+
+class DeviceBlock(models.Model):
+    """Records device/IP that have abused trials or referrals."""
+    telegram_user     = models.ForeignKey(TelegramUser, on_delete=models.CASCADE, related_name='blocks')
+    device_fingerprint= models.CharField(max_length=256)
+    ip_address        = models.GenericIPAddressField()
+    reason            = models.CharField(max_length=200)
+    blocked_at        = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        indexes = [
-            models.Index(fields=['event_type', 'created_at']),
-        ]
+        unique_together = [('device_fingerprint','ip_address')]
+
