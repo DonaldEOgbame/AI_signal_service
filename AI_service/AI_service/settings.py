@@ -10,6 +10,7 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
+from decouple import config, Csv
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -20,12 +21,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-kez7dyl(6*g+lrrv+3$906pk6zd&yz9s0w#tdx8x&fm*$1)=si'
+SECRET_KEY = config('SECRET_KEY')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = config('DEBUG', default=True, cast=bool)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = config('ALLOWED_HOSTS', default='', cast=Csv())
 
 
 # Application definition
@@ -121,3 +122,44 @@ STATIC_URL = 'static/'
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Telegram & Bot Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+
+TELEGRAM_API_ID        = config('TELEGRAM_API_ID', cast=int)
+TELEGRAM_API_HASH      = config('TELEGRAM_API_HASH')
+TELEGRAM_BOT_TOKEN     = config('TELEGRAM_BOT_TOKEN')
+ADMIN_BROADCAST_TOKEN  = config('ADMIN_BROADCAST_TOKEN')
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Payment & Webhook
+# ──────────────────────────────────────────────────────────────────────────────
+
+PAYSTACK_SECRET_KEY    = config('PAYSTACK_SECRET_KEY')
+SITE_URL               = config('SITE_URL')  # e.g. https://yourdomain.com
+
+# ──────────────────────────────────────────────────────────────────────────────
+# External API Credentials
+# ──────────────────────────────────────────────────────────────────────────────
+
+GOOGLE_APPLICATION_CREDENTIALS = config('GOOGLE_APPLICATION_CREDENTIALS')
+OPENAI_API_KEY               = config('OPENAI_API_KEY')
+
+# ──────────────────────────────────────────────────────────────────────────────
+# MetaTrader5 Credentials
+# ──────────────────────────────────────────────────────────────────────────────
+
+MT5_SERVER   = config('MT5_SERVER')
+MT5_LOGIN    = config('MT5_LOGIN', cast=int)
+MT5_PASSWORD = config('MT5_PASSWORD')
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Bot & Scheduler Defaults
+# ──────────────────────────────────────────────────────────────────────────────
+
+BOT_PAUSED    = False
+TRIAL_DAYS    = config('TRIAL_DAYS', default=7, cast=int)
+GRACE_HOURS   = config('GRACE_HOURS', default=24, cast=int)
+MAX_MSG_RATE  = config('MAX_MSG_RATE', default=30.0, cast=float)
