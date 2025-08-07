@@ -1,5 +1,5 @@
 from django.db import models
-from django.db.models import F
+from django.db.models import F, Avg, Case, When, FloatField
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 from django.utils import timezone
@@ -53,8 +53,8 @@ class Subscription(models.Model):
     allowed_weekdays  = models.JSONField(default=list, blank=True)  # 0=Mon .. 6=Sun
     min_volume        = models.FloatField(default=0.0)
     avoid_high_impact = models.BooleanField(default=False)
-    news_window_minutes = models.IntegerField(default=0)
-    vol_threshold     = models.FloatField(default=0.0)
+    news_window_minutes = models.PositiveIntegerField(default=30)
+    vol_threshold     = models.FloatField(default=0.05)
     # MT5 credentials (encrypted)
     mt5_server        = models.CharField(max_length=100, blank=True)
     mt5_login         = models.CharField(max_length=32, blank=True)
@@ -88,6 +88,24 @@ class TelegramSource(models.Model):
 
     def __str__(self):
         return self.title
+
+    def update_reputation(self):
+        fb_avg = Feedback.objects.filter(
+            signal__raw_message__source=self
+        ).aggregate(
+            avg=Avg(
+                Case(
+                    When(useful=True, then=1),
+                    When(useful=False, then=-1),
+                    output_field=FloatField(),
+                )
+            )
+        )["avg"] or 0
+        exp_avg = BacktestResult.objects.filter(source=self).aggregate(
+            avg=Avg("expectancy")
+        )["avg"] or 0
+        self.reputation = 50 + (fb_avg * 25) + (exp_avg * 25)
+        self.save(update_fields=["reputation"])
 
 
 class UserSource(models.Model):
@@ -319,4 +337,19 @@ def incr_signal_count(sender, instance, created, **kwargs):
         if src.message_count:
             src.last_quality = src.signal_count / src.message_count
             src.save(update_fields=['last_quality'])
+
+
+@receiver(post_save, sender=Feedback)
+def update_reputation_feedback(sender, instance, **kwargs):
+    instance.signal.raw_message.source.update_reputation()
+
+
+@receiver(post_save, sender=TradeOrder)
+def update_reputation_trade(sender, instance, **kwargs):
+    instance.signal.raw_message.source.update_reputation()
+
+
+@receiver(post_save, sender=BacktestResult)
+def update_reputation_backtest(sender, instance, **kwargs):
+    instance.source.update_reputation()
 
