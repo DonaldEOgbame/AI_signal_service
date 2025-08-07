@@ -3,6 +3,8 @@ import json
 import asyncio
 import logging
 import uuid
+import re
+import base64
 from datetime import datetime, timedelta
 
 from django.core.management.base import BaseCommand
@@ -18,14 +20,18 @@ import openai
 import requests
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from langdetect import detect
+from googletrans import Translator
 
 from core.models import (
     TelegramUser, Subscription, TelegramSource, RawMessage, Signal,
     TradeOrder, ExecutionAttempt, Feedback, BacktestResult,
-    Broadcast, SummaryReport, DeviceBlock, AnalyticsEvent
+    Broadcast, SummaryReport, DeviceBlock, AnalyticsEvent, UserSource
 )
 
 logger = logging.getLogger(__name__)
+
+translator = Translator()
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV VARS & Constants
@@ -41,12 +47,18 @@ MT5_SERVER    = os.getenv("MT5_SERVER")
 MT5_LOGIN     = int(os.getenv("MT5_LOGIN"))
 MT5_PASSWORD  = os.getenv("MT5_PASSWORD")
 ADMIN_TOKEN   = os.getenv("ADMIN_BROADCAST_TOKEN")
+ADMIN_ID      = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 TRIAL_DAYS    = 7
 GRACE_HOURS   = 24
 MAX_MSG_RATE  = 30  # msgs/sec
 
 # Scheduler
 sched = AsyncIOScheduler(timezone="UTC")
+
+# runtime state containers
+setup_state = {}
+correction_state = {}
+admin_state = {}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLIENT INITIALIZATION
@@ -71,6 +83,43 @@ client = TelegramClient('session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 async def send(user_id, text, buttons=None):
     """Send DM to a user with optional inline buttons."""
     await client.send_message(user_id, text, buttons=buttons or [])
+
+
+def encrypt(text: str) -> str:
+    return base64.b64encode(text.encode()).decode()
+
+
+def decrypt(text: str) -> str:
+    try:
+        return base64.b64decode(text.encode()).decode()
+    except Exception:
+        return text
+
+
+def translate_to_en(text: str) -> str:
+    try:
+        lang = detect(text)
+        if lang != 'en':
+            return translator.translate(text, src=lang, dest='en').text
+    except Exception:
+        return text
+    return text
+
+
+signal_regex = re.compile(r"(?P<action>buy|sell)\s+(?P<asset>[A-Za-z0-9]+).*?(?P<entry>\d+(?:\.\d+)?).*?sl[:\s]*(?P<sl>\d+(?:\.\d+)?)", re.I)
+
+
+def regex_parse(text: str):
+    match = signal_regex.search(text)
+    if not match:
+        return {}
+    d = match.groupdict()
+    return {
+        'asset': d['asset'].upper(),
+        'action': d['action'].upper(),
+        'entry': float(d['entry']),
+        'stop_loss': float(d['sl'])
+    }
 
 def record_event(user, signal=None, event_type="INGEST", duration_ms=None, metadata=None):
     AnalyticsEvent.objects.create(
@@ -196,6 +245,15 @@ async def scheduled_summaries():
             )
             await send(u.telegram_id, f"🗓️ {period.capitalize()} Summary:\n{ai}")
 
+
+async def daily_fraud_report():
+    since = timezone.now() - timedelta(hours=24)
+    blocks = DeviceBlock.objects.filter(blocked_at__gte=since)
+    if not blocks:
+        return
+    lines = [f"{b.telegram_user} – {b.reason}" for b in blocks]
+    await send(ADMIN_ID, "Fraud Report:\n" + "\n".join(lines))
+
 # ──────────────────────────────────────────────────────────────────────────────
 # TELEGRAM HANDLERS
 # ──────────────────────────────────────────────────────────────────────────────
@@ -217,6 +275,12 @@ async def cmd_start(evt):
         trial_end=timezone.now()+timedelta(days=TRIAL_DAYS),
         referral_code=str(uuid.uuid4())[:8]
     )
+    sched.add_job(lambda: asyncio.create_task(send(uid, '⌛ Trial reminder: 4 days left.')),
+                  'date', run_date=timezone.now()+timedelta(days=3))
+    sched.add_job(lambda: asyncio.create_task(send(uid, '⌛ Trial nearly over!')),
+                  'date', run_date=timezone.now()+timedelta(days=6))
+    sched.add_job(lambda: asyncio.create_task(send(uid, '🚫 Trial ended. Subscribe to continue.')),
+                  'date', run_date=timezone.now()+timedelta(days=7))
     await send(uid,
         "🤖 Welcome! Your 7-day trial begins now.\n"
         "Use /help to see available commands."
@@ -240,6 +304,18 @@ async def cmd_help(evt):
         "/backtest – Coming Soon!"
     )
     await send(evt.sender_id, text)
+
+
+@client.on(events.NewMessage(pattern='/setup'))
+async def cmd_setup(evt):
+    """Interactive setup flow for channel and MT5 credentials."""
+    uid = evt.sender_id
+    u, _ = TelegramUser.objects.get_or_create(
+        telegram_id=uid,
+        defaults={'username': evt.sender.username or ''}
+    )
+    setup_state[uid] = {'step': 'channel', 'user': u}
+    await send(uid, 'Forward a message from the channel you want monitored.')
 
 @client.on(events.NewMessage(pattern='/mode'))
 async def cmd_mode(evt):
@@ -357,12 +433,75 @@ async def cmd_flag(evt):
     except TelegramUser.DoesNotExist:
         await send(evt.sender_id, "User not found.")
 
+
+@client.on(events.NewMessage(pattern='/admin'))
+async def cmd_admin(evt):
+    if evt.sender_id != ADMIN_ID:
+        return
+    buttons = [Button.inline('Broadcast', b'adm_bc'),
+               Button.inline('View Stats', b'adm_stats')]
+    await send(evt.sender_id, 'Admin:', buttons)
+
+
+@client.on(events.NewMessage(func=lambda e: e.is_private and not e.raw_text.startswith('/')))
+async def handle_private(evt):
+    uid = evt.sender_id
+    # setup flow
+    if uid in setup_state:
+        state = setup_state[uid]
+        u = state['user']
+        if state['step'] == 'channel':
+            if evt.fwd_from and evt.fwd_from.channel_id:
+                chat = await evt.forward.get_chat() if evt.forward else await evt.get_chat()
+                src, _ = TelegramSource.objects.get_or_create(
+                    chat_id=evt.fwd_from.channel_id,
+                    defaults={'title': getattr(chat, 'title', 'Channel')}
+                )
+                UserSource.objects.get_or_create(user=u, source=src)
+                setup_state[uid]['step'] = 'mt5'
+                await send(uid, 'Send MT5 server login password separated by spaces.')
+            else:
+                await send(uid, 'Please forward a message from the channel.')
+        elif state['step'] == 'mt5':
+            parts = evt.raw_text.split()
+            if len(parts) != 3:
+                await send(uid, 'Format: <server> <login> <password>')
+            else:
+                sub = Subscription.objects.get(user=u)
+                sub.mt5_server = encrypt(parts[0])
+                sub.mt5_login = encrypt(parts[1])
+                sub.mt5_password = encrypt(parts[2])
+                sub.save()
+                await send(uid, 'Setup complete.')
+                del setup_state[uid]
+        return
+    # correction flow
+    if uid in correction_state:
+        sig_id = correction_state.pop(uid)
+        try:
+            field, value = evt.raw_text.split('=',1)
+            sig = Signal.objects.get(id=sig_id)
+            setattr(sig, field.strip(), value.strip())
+            sig.save()
+            await send(uid, 'Signal updated.')
+        except Exception:
+            await send(uid, 'Format should be field=value')
+        return
+    # admin broadcast text
+    if uid in admin_state and admin_state[uid]=='broadcast':
+        Broadcast.objects.create(
+            sender=TelegramUser.objects.filter(telegram_id=uid).first(),
+            text=evt.raw_text
+        )
+        await send(uid, 'Broadcast queued.')
+        del admin_state[uid]
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Message Listener for Signal Channels
 # ──────────────────────────────────────────────────────────────────────────────
 
-@client.on(events.NewMessage)
-async def all_message(evt):
+# @client.on(events.NewMessage)
+async def legacy_all_message(evt):
     if settings.BOT_PAUSED: return
     chat_id = evt.chat_id
     try:
@@ -448,27 +587,159 @@ async def all_message(evt):
     if sub.mode=='aggressive':
         await handle_execution(u, sig, size)
 
+
+@client.on(events.NewMessage(func=lambda e: e.is_group or e.is_channel))
+async def all_message(evt):
+    if settings.BOT_PAUSED:
+        return
+    chat_id = evt.chat_id
+    try:
+        src = TelegramSource.objects.get(chat_id=chat_id)
+    except TelegramSource.DoesNotExist:
+        return
+    rm = RawMessage.objects.create(
+        source=src,
+        telegram_msg_id=str(evt.id),
+        text=evt.raw_text or "",
+    )
+    if isinstance(evt.media, MessageMediaPhoto):
+        path = await evt.download_media()
+        ocr = ocr_extract(path)
+        rm.ocr_text = ocr
+        rm.save()
+    blob = rm.text + "\n" + (rm.ocr_text or "")
+    blob = translate_to_en(blob)
+    parsed = regex_parse(blob) or nlp_parse(blob)
+    if not parsed.get('asset'):
+        return
+    upd = re.search(r'update\s+sl\s+to\s+(\d+(?:\.\d+)?)', blob, re.I)
+    if upd:
+        new_sl = float(upd.group(1))
+        orders = TradeOrder.objects.filter(signal__asset__iexact=parsed['asset'], status='EXECUTED')
+        for o in orders:
+            try:
+                mt5.order_send({'action': mt5.TRADE_ACTION_SLTP, 'symbol': o.signal.asset, 'sl': new_sl})
+                o.signal.stop_loss = new_sl
+                o.signal.exit_origin = 'UPDATED'
+                o.signal.save()
+            except Exception:
+                continue
+        return
+    key = f"{parsed['asset']}{parsed['action']}{parsed['entry']}{parsed['stop_loss']}"
+    recent = Signal.objects.filter(dedup_key=key, timestamp_utc__gte=timezone.now()-timedelta(seconds=30))
+    if recent.exists():
+        return
+    recent_asset = Signal.objects.filter(
+        asset=parsed['asset'], timestamp_utc__gte=timezone.now()-timedelta(minutes=2)
+    )
+    conflict, prev = False, None
+    if recent_asset.exists() and recent_asset[0].action != parsed['action']:
+        conflict, prev = True, recent_asset[0]
+    winner, reason = None, ""
+    if conflict:
+        snap = {}
+        pick, reason = select_conflict(parsed, {
+            'asset': prev.asset, 'action': prev.action,
+            'entry': prev.entry_price, 'stop_loss': prev.stop_loss
+        }, snap)
+        if pick == '2':
+            return
+    sig = Signal.objects.create(
+        raw_message=rm,
+        asset=parsed['asset'], action=parsed['action'],
+        entry_price=parsed['entry'], stop_loss=parsed['stop_loss'],
+        target_prices=parsed.get('targets', []),
+        timeframe=parsed.get('timeframe', ''),
+        trade_type=parsed.get('trade_type', ''),
+        confidence=parsed.get('confidence', 0),
+        exit_origin=parsed.get('exit_origin', 'EXPLICIT'),
+        is_conflict=conflict, conflict_winner=(not conflict or True),
+        conflict_reason=reason, reason=parsed.get('reason', ''),
+        timestamp_utc=timezone.now(),
+        expires_at_utc=timezone.now() + timedelta(minutes=30),
+        dedup_key=key
+    )
+    buttons = [
+        Button.inline("✅ Approve", f"approve:{sig.id}"),
+        Button.inline("❌ Reject", f"reject:{sig.id}"),
+        Button.inline("👍 Useful", f"useful:{sig.id}"),
+        Button.inline("👎 Not", f"notuse:{sig.id}"),
+        Button.inline("✏️ Correct", f"correct:{sig.id}")
+    ]
+    card = (
+        f"🔔 Signal {sig.id}\n"
+        f"{sig.asset} ▶️ {sig.action}\n"
+        f"Entry: {sig.entry_price}\nSL: {sig.stop_loss}\n"
+        f"TP: {','.join(map(str, sig.target_prices))}\n"
+        f"Conf: {sig.confidence}%"
+    )
+    for u in src.subscribed_by.all():
+        sub = Subscription.objects.get(user=u)
+        now = timezone.now()
+        if sub.status == 'TRIAL' and now > sub.trial_end + timedelta(hours=GRACE_HOURS):
+            await send(u.telegram_id, "🚫 Trial expired. Subscribe to continue.")
+            continue
+        if sub.trading_start and sub.trading_end and not (sub.trading_start <= now.time() <= sub.trading_end):
+            continue
+        if sub.allowed_weekdays and now.weekday() not in sub.allowed_weekdays:
+            continue
+        if sub.allowed_symbols and parsed['asset'] not in sub.allowed_symbols:
+            continue
+        if sub.blocked_symbols and parsed['asset'] in sub.blocked_symbols:
+            continue
+        tick = mt5.symbol_info_tick(parsed['asset'])
+        if tick and sub.min_volume and getattr(tick, 'volume', 0) < sub.min_volume:
+            continue
+        size = calculate_size(sub, parsed['entry'], parsed['stop_loss'])
+        await send(u.telegram_id, card + f"\nSize: {size:.4f}", buttons)
+        if sub.mode == 'aggressive':
+            await handle_execution(u, sig, size)
+    if src.last_quality < 0.1:
+        for u in src.subscribed_by.all():
+            msg = f"{src.title} is {100*(1-src.last_quality):.0f}% noise—unsubscribe?"
+            btns = [Button.inline('Yes', f'unsub:{src.id}'), Button.inline('No', f'keep:{src.id}')]
+            await send(u.telegram_id, msg, btns)
+
 @client.on(events.CallbackQuery)
 async def callback(evt):
     data = evt.data.decode()
-    uid  = evt.sender_id
-    u    = TelegramUser.objects.get(telegram_id=uid)
-    # parse action + signal id
-    action = data[:7]
-    sig_id = uuid.UUID(bytes=evt.data[7:])
-    sig    = Signal.objects.get(id=sig_id)
-    if action=="approve":
-        size = calculate_size(u.subscription, sig.entry_price, sig.stop_loss)
-        await handle_execution(u, sig, size)
-        await evt.answer("Order approved & placed.")
-    elif action=="reject":
-        await evt.answer("Signal rejected.")
-    elif action=="useful":
-        Feedback.objects.create(user=u, signal=sig, useful=True)
-        await evt.answer("Marked useful.")
-    elif action=="notuse":
-        Feedback.objects.create(user=u, signal=sig, useful=False)
-        await evt.answer("Marked not useful.")
+    uid = evt.sender_id
+    if ':' in data:
+        action, ident = data.split(':', 1)
+    else:
+        action, ident = data, None
+    if action in {'approve', 'reject', 'useful', 'notuse', 'correct'} and ident:
+        u = TelegramUser.objects.get(telegram_id=uid)
+        sig = Signal.objects.get(id=ident)
+        if action == 'approve':
+            size = calculate_size(u.subscription, sig.entry_price, sig.stop_loss)
+            await handle_execution(u, sig, size)
+            await evt.answer('Order approved & placed.')
+        elif action == 'reject':
+            await evt.answer('Signal rejected.')
+        elif action == 'useful':
+            Feedback.objects.create(user=u, signal=sig, useful=True)
+            await evt.answer('Marked useful.')
+        elif action == 'notuse':
+            Feedback.objects.create(user=u, signal=sig, useful=False)
+            await evt.answer('Marked not useful.')
+        elif action == 'correct':
+            correction_state[uid] = sig.id
+            await evt.answer('Send field=value')
+    elif action == 'adm_bc':
+        admin_state[uid] = 'broadcast'
+        await evt.answer('Send broadcast text')
+    elif action == 'adm_stats':
+        count = TelegramUser.objects.count()
+        await send(uid, f'Users: {count}')
+        await evt.answer()
+    elif action == 'unsub' and ident:
+        src = TelegramSource.objects.get(id=int(ident))
+        u = TelegramUser.objects.get(telegram_id=uid)
+        src.subscribed_by.remove(u)
+        await evt.answer('Unsubscribed')
+    elif action == 'keep':
+        await evt.answer('Kept')
 
 async def handle_execution(user, sig, size):
     # MT5 order logic
@@ -524,6 +795,8 @@ class Command(BaseCommand):
                       'cron', hour=23, minute=50)
         sched.add_job(lambda: asyncio.create_task(dispatch_broadcasts()),
                       'interval', seconds=60)
+        sched.add_job(lambda: asyncio.create_task(daily_fraud_report()),
+                      'cron', hour=0, minute=0)
         sched.start()
         # Run Telethon event loop
         client.run_until_disconnected()

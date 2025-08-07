@@ -1,4 +1,7 @@
 from django.db import models
+from django.db.models import F
+from django.db.models.signals import post_save
+from django.dispatch import receiver
 from django.utils import timezone
 import uuid
 
@@ -43,9 +46,19 @@ class Subscription(models.Model):
     # User preferences
     mode              = models.CharField(max_length=10, default='moderate')  # conservative/moderate/aggressive
     risk_pct          = models.FloatField(default=0.5)  # percent of equity per trade
+    allowed_symbols   = models.JSONField(default=list, blank=True)
+    blocked_symbols   = models.JSONField(default=list, blank=True)
+    trading_start     = models.TimeField(null=True, blank=True)
+    trading_end       = models.TimeField(null=True, blank=True)
+    allowed_weekdays  = models.JSONField(default=list, blank=True)  # 0=Mon .. 6=Sun
+    min_volume        = models.FloatField(default=0.0)
+    # MT5 credentials (encrypted)
+    mt5_server        = models.CharField(max_length=100, blank=True)
+    mt5_login         = models.CharField(max_length=32, blank=True)
+    mt5_password      = models.CharField(max_length=256, blank=True)
     # Device/IP lock for trial
-    trial_device      = models.CharField(max_length=256, blank=True)
-    trial_ip          = models.GenericIPAddressField(null=True, blank=True)
+    trial_device      = models.CharField(max_length=256, blank=True, null=True, unique=True)
+    trial_ip          = models.GenericIPAddressField(null=True, blank=True, unique=True)
 
     def __str__(self):
         return f"{self.user} → {self.status}"
@@ -65,12 +78,23 @@ class TelegramSource(models.Model):
     last_quality      = models.FloatField(default=0.0)     # signal_count/message_count
     created_at        = models.DateTimeField(auto_now_add=True)
     updated_at        = models.DateTimeField(auto_now=True)
+    subscribed_by     = models.ManyToManyField('TelegramUser', through='UserSource', related_name='sources')
 
     class Meta:
         ordering = ['-reputation']
 
     def __str__(self):
         return self.title
+
+
+class UserSource(models.Model):
+    """Which users subscribed/forwarded which channels."""
+    user    = models.ForeignKey(TelegramUser, on_delete=models.CASCADE)
+    source  = models.ForeignKey(TelegramSource, on_delete=models.CASCADE)
+    added_at= models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('user', 'source')]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -265,4 +289,31 @@ class DeviceBlock(models.Model):
 
     class Meta:
         unique_together = [('device_fingerprint','ip_address')]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 8. Signals for counters
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@receiver(post_save, sender=RawMessage)
+def incr_message_count(sender, instance, created, **kwargs):
+    """Increment message counter for a source."""
+    if created:
+        TelegramSource.objects.filter(id=instance.source_id).update(
+            message_count=F('message_count') + 1
+        )
+
+
+@receiver(post_save, sender=Signal)
+def incr_signal_count(sender, instance, created, **kwargs):
+    """Increment signal counter and recalc last_quality."""
+    if created:
+        TelegramSource.objects.filter(id=instance.raw_message.source_id).update(
+            signal_count=F('signal_count') + 1
+        )
+        src = TelegramSource.objects.get(id=instance.raw_message.source_id)
+        if src.message_count:
+            src.last_quality = src.signal_count / src.message_count
+            src.save(update_fields=['last_quality'])
 
