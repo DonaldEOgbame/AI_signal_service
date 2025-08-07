@@ -206,7 +206,7 @@ async def dispatch_broadcasts():
             await asyncio.sleep(1/MAX_MSG_RATE)
         bc.delete()
 
-async def scheduled_summaries():
+async def scheduled_summaries(target_user=None, period=None, tone=None):
     now = timezone.now()
     periods = [
         ('day', timedelta(days=1)),
@@ -215,21 +215,25 @@ async def scheduled_summaries():
         ('quarter', timedelta(days=90)),
         ('year', timedelta(days=365)),
     ]
-    for period, delta in periods:
+    users = [target_user] if target_user else TelegramUser.objects.all()
+    for p, delta in periods:
+        if period and p != period:
+            continue
         start = now - delta
-        for u in TelegramUser.objects.all():
+        for u in users:
             orders = TradeOrder.objects.filter(
                 user=u, status='EXECUTED',
                 executed_at__range=(start, now)
             )
-            if not orders: continue
+            if not orders:
+                continue
             total = sum(o.profit_loss for o in orders)
             wr = orders.filter(profit_loss__gt=0).count()/orders.count()*100
             best = max(orders, key=lambda o: o.profit_loss)
             worst= min(orders, key=lambda o: o.profit_loss)
+            actual_tone = tone or ('humorous' if u.subscription.mode=='aggressive' else 'serious')
             prompt = (
-                f"Write a {'humorous' if u.subscription.mode=='aggressive' else 'serious'} "
-                f"{period} summary: {len(orders)} trades, P/L {total:.2f}%, "
+                f"Write a {actual_tone} {p} summary: {len(orders)} trades, P/L {total:.2f}%, "
                 f"win-rate {wr:.1f}%, best {best.signal.asset}{best.signal.action}+{best.profit_loss:.2f}%, "
                 f"worst {worst.signal.asset}{worst.signal.action}{worst.profit_loss:.2f}%."
             )
@@ -238,12 +242,12 @@ async def scheduled_summaries():
                 max_tokens=200, temperature=0.7
             ).choices[0].text.strip()
             SummaryReport.objects.create(
-                user=u, period_type=period,
+                user=u, period_type=p,
                 period_start=start.date(), period_end=now.date(),
-                tone='humorous' if u.subscription.mode=='aggressive' else 'serious',
+                tone=actual_tone,
                 summary_text=ai
             )
-            await send(u.telegram_id, f"🗓️ {period.capitalize()} Summary:\n{ai}")
+            await send(u.telegram_id, f"🗓️ {p.capitalize()} Summary:\n{ai}")
 
 
 async def daily_fraud_report():
@@ -408,12 +412,13 @@ async def cmd_health(evt):
 
 @client.on(events.NewMessage(pattern='/summary'))
 async def cmd_summary(evt):
-    parts=evt.raw_text.split()
-    if len(parts)<2 or parts[1] not in ['day','week','month','quarter','year']:
+    parts = evt.raw_text.split()
+    if len(parts) < 2 or parts[1] not in ['day', 'week', 'month', 'quarter', 'year']:
         return await send(evt.sender_id, "Usage: /summary <period> [humorous|serious]")
-    period, tone = parts[1], parts[2] if len(parts)>2 else 'humorous'
-    # trigger immediate summary job for this user only
-    await scheduled_summaries()  # will DM to all; you could filter by user here
+    period = parts[1]
+    tone = parts[2] if len(parts) > 2 else None
+    u = TelegramUser.objects.get(telegram_id=evt.sender_id)
+    await scheduled_summaries(target_user=u, period=period, tone=tone)
 
 @client.on(events.NewMessage(pattern='/flag'))
 async def cmd_flag(evt):
@@ -441,6 +446,34 @@ async def cmd_admin(evt):
     buttons = [Button.inline('Broadcast', b'adm_bc'),
                Button.inline('View Stats', b'adm_stats')]
     await send(evt.sender_id, 'Admin:', buttons)
+
+
+@client.on(events.NewMessage(pattern='/channels'))
+async def cmd_channels(evt):
+    parts = evt.raw_text.split()
+    u = TelegramUser.objects.get(telegram_id=evt.sender_id)
+    if len(parts) == 1:
+        subs = u.sources.all()
+        if not subs:
+            return await send(evt.sender_id, "No channel subscriptions.")
+        lines = [f"{s.id}: {s.title}" for s in subs]
+        msg = "Your channels:\n" + "\n".join(lines)
+        msg += "\nUse /channels remove <id> to unsubscribe."
+        await send(evt.sender_id, msg)
+    elif len(parts) == 3 and parts[1] == 'remove':
+        try:
+            src = TelegramSource.objects.get(id=int(parts[2]))
+            src.subscribed_by.remove(u)
+            await send(evt.sender_id, f"Removed {src.title}.")
+        except (TelegramSource.DoesNotExist, ValueError):
+            await send(evt.sender_id, "Invalid channel id.")
+    else:
+        await send(evt.sender_id, "Usage: /channels [remove <id>]")
+
+
+@client.on(events.NewMessage(pattern='/backtest'))
+async def cmd_backtest(evt):
+    await send(evt.sender_id, "Backtesting coming soon!")
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_private and not e.raw_text.startswith('/')))

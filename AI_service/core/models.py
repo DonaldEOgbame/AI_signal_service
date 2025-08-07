@@ -52,6 +52,9 @@ class Subscription(models.Model):
     trading_end       = models.TimeField(null=True, blank=True)
     allowed_weekdays  = models.JSONField(default=list, blank=True)  # 0=Mon .. 6=Sun
     min_volume        = models.FloatField(default=0.0)
+    avoid_high_impact = models.BooleanField(default=False)
+    news_window_minutes = models.IntegerField(default=0)
+    vol_threshold     = models.FloatField(default=0.0)
     # MT5 credentials (encrypted)
     mt5_server        = models.CharField(max_length=100, blank=True)
     mt5_login         = models.CharField(max_length=32, blank=True)
