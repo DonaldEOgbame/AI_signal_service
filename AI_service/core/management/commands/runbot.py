@@ -22,6 +22,9 @@ import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from langdetect import detect
 from googletrans import Translator
+from django.db.models import Sum, Avg, F, ExpressionWrapper, DurationField
+
+from core.ui import EMOJI, color_text
 
 from core.models import (
     TelegramUser, Subscription, TelegramSource, RawMessage, Signal,
@@ -382,17 +385,59 @@ async def cmd_referral(evt):
 
 @client.on(events.NewMessage(pattern='/status'))
 async def cmd_status(evt):
-    u=TelegramUser.objects.get(telegram_id=evt.sender_id)
-    sub=Subscription.objects.get(user=u)
-    orders=TradeOrder.objects.filter(user=u).order_by('-placed_at')[:5]
-    text=(
+    u = TelegramUser.objects.get(telegram_id=evt.sender_id)
+    sub = Subscription.objects.get(user=u)
+    orders = TradeOrder.objects.filter(user=u).select_related('signal').order_by('-placed_at')[:10]
+
+    total_signals = Signal.objects.filter(raw_message__source__subscribed_by=u).count()
+    executed = TradeOrder.objects.filter(user=u, status='EXECUTED').count()
+
+    account = mt5.account_info()
+    today = timezone.now().date()
+    today_pl = (
+        TradeOrder.objects.filter(user=u, executed_at__date=today)
+        .aggregate(sum=Sum('profit_loss'))['sum'] or 0
+    )
+    equity_change = 0.0
+    if account and account.equity:
+        equity_change = (today_pl / account.equity) * 100
+
+    avg_dur = (
+        TradeOrder.objects.filter(user=u, executed_at__isnull=False, placed_at__isnull=False)
+        .annotate(dur=ExpressionWrapper(F('executed_at') - F('placed_at'), output_field=DurationField()))
+        .aggregate(avg=Avg('dur'))['avg']
+    )
+    if avg_dur:
+        total_sec = int(avg_dur.total_seconds())
+        hours, minutes = divmod(total_sec // 60, 60)
+        avg_hold = f"{hours}h {minutes}m"
+    else:
+        avg_hold = "0m"
+
+    top = (
+        TradeOrder.objects.filter(user=u, status='EXECUTED')
+        .values('signal__asset').annotate(pl=Sum('profit_loss'))
+        .order_by('-pl').first()
+    )
+    top_symbol = f"{top['signal__asset']} ({top['pl']:+.1f}%) {EMOJI['spark']}" if top else 'N/A'
+
+    text = (
         f"📊 Status:\nSubscription: {sub.status}\n"
         f"Trial ends: {sub.trial_end.date()}\n"
         f"Mode: {sub.mode}, Risk: {sub.risk_pct}%\n"
-        f"Last 5 Orders:\n"
+        f"Signals Parsed: {total_signals} | Trades Executed: {executed}\n"
+        f"📈 Equity Change Today: {equity_change:+.1f}%\n"
+        f"🕒 Avg Hold Time: {avg_hold}\n"
+        f"🏆 Top Symbol: {top_symbol}\n"
+        f"📜 Trade History:\n"
     )
     for o in orders:
-        text+=f"- {o.signal.asset}{o.signal.action}@{o.signal.entry_price} → {o.status}\n"
+        pl = o.profit_loss or 0
+        icon = 'green' if pl >= 0 else 'red'
+        entry_ts = o.placed_at.strftime('%Y-%m-%d %H:%M') if o.placed_at else '—'
+        exit_ts = o.executed_at.strftime('%Y-%m-%d %H:%M') if o.executed_at else '—'
+        line = f"{o.signal.asset} {o.signal.action} @{o.signal.entry_price} → {pl:+.1f}% ({entry_ts} → {exit_ts})"
+        text += color_text(line, icon) + "\n"
     await send(evt.sender_id, text)
 
 @client.on(events.NewMessage(pattern='/top'))
@@ -406,7 +451,7 @@ async def cmd_top(evt):
     ).order_by('-expectancy')[:5]
     text=f"🏆 Top Channels ({period}):\n"
     for r in rows:
-        text+=f"{r.source.title}: Exp {r.expectancy:.2f}% | Hit {r.hit_rate:.0f}%\n"
+        text+=f"{EMOJI['spark']} {r.source.title}: Exp {r.expectancy:.2f}% | Hit {r.hit_rate:.0f}%\n"
     await send(evt.sender_id, text)
 
 @client.on(events.NewMessage(pattern='/pause'))
@@ -749,14 +794,14 @@ async def all_message(evt):
             events = fetch_high_impact_events(parsed['asset'], sub.news_window_minutes)
             if events:
                 if sub.mode != 'aggressive':
-                    await send(u.telegram_id, "⏸️ Trade skipped due to high-impact news.")
+                    await send(u.telegram_id, f"{EMOJI['news']} Trade skipped due to high-impact news.")
                     continue
                 pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
                 btns = [
                     Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
                     Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
                 ]
-                await send(u.telegram_id, "⚠️ High-impact news detected. Proceed?", btns)
+                await send(u.telegram_id, f"{EMOJI['news']}{EMOJI['warning']} High-impact news detected. Proceed?", btns)
                 continue
         # ATR volatility filter
         if sub.vol_threshold:
@@ -765,14 +810,14 @@ async def all_message(evt):
             atr_ratio = atr / price if price else 0
             if atr_ratio > sub.vol_threshold:
                 if sub.mode != 'aggressive':
-                    await send(u.telegram_id, "⏸️ Trade skipped due to high volatility.")
+                    await send(u.telegram_id, f"{EMOJI['volatility']} Trade skipped due to high volatility.")
                     continue
                 pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
                 btns = [
                     Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
                     Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
                 ]
-                await send(u.telegram_id, "⚠️ Volatility high. Force trade?", btns)
+                await send(u.telegram_id, f"{EMOJI['volatility']}{EMOJI['warning']} Volatility high. Force trade?", btns)
                 continue
         await send(u.telegram_id, card + f"\nSize: {size:.4f}", buttons)
         if sub.mode == 'aggressive':
@@ -876,6 +921,12 @@ async def handle_execution(user, sig, size):
         request_payload=req, response_data=result._asdict(),
         duration_ms=totd, success=(status=="EXECUTED"), error_message=err
     )
+    msg = (
+        f"{EMOJI['check']} Order Executed: {sig.asset} {sig.action} {size:.2f} @{price}"
+        if status == "EXECUTED"
+        else f"{EMOJI['red']} Order Failed: {err}"
+    )
+    await send(user.telegram_id, msg)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RUNBOT COMMAND
