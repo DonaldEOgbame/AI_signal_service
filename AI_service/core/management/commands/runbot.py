@@ -59,6 +59,7 @@ sched = AsyncIOScheduler(timezone="UTC")
 setup_state = {}
 correction_state = {}
 admin_state = {}
+pending_force = {}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLIENT INITIALIZATION
@@ -170,6 +171,25 @@ def calculate_size(sub, entry, stop):
     raw = (equity * (sub.risk_pct/100)) / abs(entry - stop)
     mod = {'conservative':0.5,'moderate':1.0,'aggressive':1.5}[sub.mode]
     return raw * mod
+
+
+def fetch_high_impact_events(symbol, window_minutes):
+    """Placeholder for economic calendar API."""
+    return []
+
+
+def compute_atr(symbol, periods=14):
+    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_H1, 0, periods + 1)
+    if rates is None or len(rates) < periods + 1:
+        return 0.0
+    trs = []
+    for i in range(1, len(rates)):
+        high = rates[i]['high'] if isinstance(rates[i], dict) else rates[i][2]
+        low = rates[i]['low'] if isinstance(rates[i], dict) else rates[i][3]
+        prev_close = rates[i-1]['close'] if isinstance(rates[i-1], dict) else rates[i-1][4]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+    return sum(trs) / len(trs)
 
 def init_paystack_checkout(user):
     sub = user.subscription
@@ -724,6 +744,36 @@ async def all_message(evt):
         if tick and sub.min_volume and getattr(tick, 'volume', 0) < sub.min_volume:
             continue
         size = calculate_size(sub, parsed['entry'], parsed['stop_loss'])
+        # High impact news guardrail
+        if sub.avoid_high_impact:
+            events = fetch_high_impact_events(parsed['asset'], sub.news_window_minutes)
+            if events:
+                if sub.mode != 'aggressive':
+                    await send(u.telegram_id, "⏸️ Trade skipped due to high-impact news.")
+                    continue
+                pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
+                btns = [
+                    Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
+                    Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
+                ]
+                await send(u.telegram_id, "⚠️ High-impact news detected. Proceed?", btns)
+                continue
+        # ATR volatility filter
+        if sub.vol_threshold:
+            atr = compute_atr(parsed['asset'])
+            price = tick.ask if parsed['action'] == 'BUY' else tick.bid
+            atr_ratio = atr / price if price else 0
+            if atr_ratio > sub.vol_threshold:
+                if sub.mode != 'aggressive':
+                    await send(u.telegram_id, "⏸️ Trade skipped due to high volatility.")
+                    continue
+                pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
+                btns = [
+                    Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
+                    Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
+                ]
+                await send(u.telegram_id, "⚠️ Volatility high. Force trade?", btns)
+                continue
         await send(u.telegram_id, card + f"\nSize: {size:.4f}", buttons)
         if sub.mode == 'aggressive':
             await handle_execution(u, sig, size)
@@ -773,6 +823,18 @@ async def callback(evt):
         await evt.answer('Unsubscribed')
     elif action == 'keep':
         await evt.answer('Kept')
+    elif action == 'force' and ident:
+        sig_id, uid_str = ident.split(':')
+        key = (int(uid_str), sig_id)
+        if key in pending_force:
+            size, sig = pending_force.pop(key)
+            user = TelegramUser.objects.get(telegram_id=int(uid_str))
+            await handle_execution(user, sig, size)
+        await evt.answer('Order forced.')
+    elif action == 'skip' and ident:
+        sig_id, uid_str = ident.split(':')
+        pending_force.pop((int(uid_str), sig_id), None)
+        await evt.answer('Trade skipped.')
 
 async def handle_execution(user, sig, size):
     # MT5 order logic
