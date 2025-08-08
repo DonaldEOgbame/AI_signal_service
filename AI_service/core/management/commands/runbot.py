@@ -46,9 +46,6 @@ PAYSTACK_KEY  = os.getenv("PAYSTACK_SECRET_KEY")
 PAYSTACK_URL  = "https://api.paystack.co/transaction/initialize"
 GOOGLE_CREDS  = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
 OPENAI_KEY    = os.getenv("OPENAI_API_KEY")
-MT5_SERVER    = os.getenv("MT5_SERVER")
-MT5_LOGIN     = int(os.getenv("MT5_LOGIN"))
-MT5_PASSWORD  = os.getenv("MT5_PASSWORD")
 ADMIN_TOKEN   = os.getenv("ADMIN_BROADCAST_TOKEN")
 ADMIN_ID      = int(os.getenv("ADMIN_TELEGRAM_ID", "0"))
 TRIAL_DAYS    = 7
@@ -74,9 +71,6 @@ vision_client = vision.ImageAnnotatorClient()
 # OpenAI
 openai.api_key = OPENAI_KEY
 
-# MT5
-mt5.initialize(server=MT5_SERVER, login=MT5_LOGIN, password=MT5_PASSWORD)
-
 # Telethon
 client = TelegramClient('session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
@@ -98,6 +92,18 @@ def decrypt(text: str) -> str:
         return base64.b64decode(text.encode()).decode()
     except Exception:
         return text
+
+
+def init_mt5(sub: Subscription) -> bool:
+    """Initialize MT5 connection for a user's subscription."""
+    try:
+        return mt5.initialize(
+            server=decrypt(sub.mt5_server),
+            login=int(decrypt(sub.mt5_login)),
+            password=decrypt(sub.mt5_password),
+        )
+    except Exception:
+        return False
 
 
 def translate_to_en(text: str) -> str:
@@ -392,7 +398,10 @@ async def cmd_status(evt):
     total_signals = Signal.objects.filter(raw_message__source__subscribed_by=u).count()
     executed = TradeOrder.objects.filter(user=u, status='EXECUTED').count()
 
-    account = mt5.account_info()
+    account = None
+    if init_mt5(sub):
+        account = mt5.account_info()
+        mt5.shutdown()
     today = timezone.now().date()
     today_pl = (
         TradeOrder.objects.filter(user=u, executed_at__date=today)
@@ -467,9 +476,14 @@ async def cmd_resume(evt):
 
 @client.on(events.NewMessage(pattern='/health'))
 async def cmd_health(evt):
+    sub = Subscription.objects.first()
+    mt5_status = "fail"
+    if sub and init_mt5(sub):
+        mt5_status = "ok"
+        mt5.shutdown()
     res = {
         "telegram": "ok",
-        "mt5":     "ok" if mt5.initialize() else "fail",
+        "mt5":     mt5_status,
         "vision":  "ok" if vision_client else "fail",
         "openai":  "ok" if openai.api_key else "fail",
     }
@@ -638,6 +652,9 @@ async def legacy_all_message(evt):
     if sub.status=='TRIAL' and timezone.now()>sub.trial_end+timedelta(hours=GRACE_HOURS):
         await send(u.telegram_id, "🚫 Trial expired. Subscribe to continue.")
         return
+    if not init_mt5(sub):
+        await send(u.telegram_id, "MT5 connection failed.")
+        return
     size = calculate_size(sub, parsed['entry'], parsed['stop_loss'])
     # conflict resolution
     winner, reason = None, ""
@@ -683,7 +700,8 @@ async def legacy_all_message(evt):
     await send(u.telegram_id, card, buttons)
     # auto-exec if aggressive
     if sub.mode=='aggressive':
-        await handle_execution(u, sig, size)
+        await handle_execution(u, sig, size, sub)
+    mt5.shutdown()
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_group or e.is_channel))
@@ -715,13 +733,18 @@ async def all_message(evt):
         new_sl = float(upd.group(1))
         orders = TradeOrder.objects.filter(signal__asset__iexact=parsed['asset'], status='EXECUTED')
         for o in orders:
+            sub = Subscription.objects.get(user=o.user)
+            if not init_mt5(sub):
+                continue
             try:
                 mt5.order_send({'action': mt5.TRADE_ACTION_SLTP, 'symbol': o.signal.asset, 'sl': new_sl})
                 o.signal.stop_loss = new_sl
                 o.signal.exit_origin = 'UPDATED'
                 o.signal.save()
             except Exception:
-                continue
+                pass
+            finally:
+                mt5.shutdown()
         return
     key = f"{parsed['asset']}{parsed['action']}{parsed['entry']}{parsed['stop_loss']}"
     recent = Signal.objects.filter(dedup_key=key, timestamp_utc__gte=timezone.now()-timedelta(seconds=30))
@@ -777,51 +800,57 @@ async def all_message(evt):
         if sub.status == 'TRIAL' and now > sub.trial_end + timedelta(hours=GRACE_HOURS):
             await send(u.telegram_id, "🚫 Trial expired. Subscribe to continue.")
             continue
-        if sub.trading_start and sub.trading_end and not (sub.trading_start <= now.time() <= sub.trading_end):
+        if not init_mt5(sub):
+            await send(u.telegram_id, "MT5 connection failed.")
             continue
-        if sub.allowed_weekdays and now.weekday() not in sub.allowed_weekdays:
-            continue
-        if sub.allowed_symbols and parsed['asset'] not in sub.allowed_symbols:
-            continue
-        if sub.blocked_symbols and parsed['asset'] in sub.blocked_symbols:
-            continue
-        tick = mt5.symbol_info_tick(parsed['asset'])
-        if tick and sub.min_volume and getattr(tick, 'volume', 0) < sub.min_volume:
-            continue
-        size = calculate_size(sub, parsed['entry'], parsed['stop_loss'])
-        # High impact news guardrail
-        if sub.avoid_high_impact:
-            events = fetch_high_impact_events(parsed['asset'], sub.news_window_minutes)
-            if events:
-                if sub.mode != 'aggressive':
-                    await send(u.telegram_id, f"{EMOJI['news']} Trade skipped due to high-impact news.")
-                    continue
-                pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
-                btns = [
-                    Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
-                    Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
-                ]
-                await send(u.telegram_id, f"{EMOJI['news']}{EMOJI['warning']} High-impact news detected. Proceed?", btns)
+        try:
+            if sub.trading_start and sub.trading_end and not (sub.trading_start <= now.time() <= sub.trading_end):
                 continue
-        # ATR volatility filter
-        if sub.vol_threshold:
-            atr = compute_atr(parsed['asset'])
-            price = tick.ask if parsed['action'] == 'BUY' else tick.bid
-            atr_ratio = atr / price if price else 0
-            if atr_ratio > sub.vol_threshold:
-                if sub.mode != 'aggressive':
-                    await send(u.telegram_id, f"{EMOJI['volatility']} Trade skipped due to high volatility.")
-                    continue
-                pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
-                btns = [
-                    Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
-                    Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
-                ]
-                await send(u.telegram_id, f"{EMOJI['volatility']}{EMOJI['warning']} Volatility high. Force trade?", btns)
+            if sub.allowed_weekdays and now.weekday() not in sub.allowed_weekdays:
                 continue
-        await send(u.telegram_id, card + f"\nSize: {size:.4f}", buttons)
-        if sub.mode == 'aggressive':
-            await handle_execution(u, sig, size)
+            if sub.allowed_symbols and parsed['asset'] not in sub.allowed_symbols:
+                continue
+            if sub.blocked_symbols and parsed['asset'] in sub.blocked_symbols:
+                continue
+            tick = mt5.symbol_info_tick(parsed['asset'])
+            if tick and sub.min_volume and getattr(tick, 'volume', 0) < sub.min_volume:
+                continue
+            size = calculate_size(sub, parsed['entry'], parsed['stop_loss'])
+            # High impact news guardrail
+            if sub.avoid_high_impact:
+                events = fetch_high_impact_events(parsed['asset'], sub.news_window_minutes)
+                if events:
+                    if sub.mode != 'aggressive':
+                        await send(u.telegram_id, f"{EMOJI['news']} Trade skipped due to high-impact news.")
+                        continue
+                    pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
+                    btns = [
+                        Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
+                        Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
+                    ]
+                    await send(u.telegram_id, f"{EMOJI['news']}{EMOJI['warning']} High-impact news detected. Proceed?", btns)
+                    continue
+            # ATR volatility filter
+            if sub.vol_threshold:
+                atr = compute_atr(parsed['asset'])
+                price = tick.ask if parsed['action'] == 'BUY' else tick.bid
+                atr_ratio = atr / price if price else 0
+                if atr_ratio > sub.vol_threshold:
+                    if sub.mode != 'aggressive':
+                        await send(u.telegram_id, f"{EMOJI['volatility']} Trade skipped due to high volatility.")
+                        continue
+                    pending_force[(u.telegram_id, str(sig.id))] = (size, sig)
+                    btns = [
+                        Button.inline("Force Trade", f"force:{sig.id}:{u.telegram_id}"),
+                        Button.inline("Skip", f"skip:{sig.id}:{u.telegram_id}")
+                    ]
+                    await send(u.telegram_id, f"{EMOJI['volatility']}{EMOJI['warning']} Volatility high. Force trade?", btns)
+                    continue
+            await send(u.telegram_id, card + f"\nSize: {size:.4f}", buttons)
+            if sub.mode == 'aggressive':
+                await handle_execution(u, sig, size, sub)
+        finally:
+            mt5.shutdown()
     if src.last_quality < 0.1:
         for u in src.subscribed_by.all():
             msg = f"{src.title} is {100*(1-src.last_quality):.0f}% noise—unsubscribe?"
@@ -839,10 +868,15 @@ async def callback(evt):
     if action in {'approve', 'reject', 'useful', 'notuse', 'correct'} and ident:
         u = TelegramUser.objects.get(telegram_id=uid)
         sig = Signal.objects.get(id=ident)
+        sub = Subscription.objects.get(user=u)
         if action == 'approve':
-            size = calculate_size(u.subscription, sig.entry_price, sig.stop_loss)
-            await handle_execution(u, sig, size)
-            await evt.answer('Order approved & placed.')
+            if init_mt5(sub):
+                size = calculate_size(sub, sig.entry_price, sig.stop_loss)
+                await handle_execution(u, sig, size, sub)
+                mt5.shutdown()
+                await evt.answer('Order approved & placed.')
+            else:
+                await evt.answer('MT5 connection failed.')
         elif action == 'reject':
             await evt.answer('Signal rejected.')
         elif action == 'useful':
@@ -874,14 +908,17 @@ async def callback(evt):
         if key in pending_force:
             size, sig = pending_force.pop(key)
             user = TelegramUser.objects.get(telegram_id=int(uid_str))
-            await handle_execution(user, sig, size)
+            sub = Subscription.objects.get(user=user)
+            if init_mt5(sub):
+                await handle_execution(user, sig, size, sub)
+                mt5.shutdown()
         await evt.answer('Order forced.')
     elif action == 'skip' and ident:
         sig_id, uid_str = ident.split(':')
         pending_force.pop((int(uid_str), sig_id), None)
         await evt.answer('Trade skipped.')
 
-async def handle_execution(user, sig, size):
+async def handle_execution(user, sig, size, sub):
     # MT5 order logic
     slippage = 0.0
     order_type = mt5.ORDER_TYPE_BUY if sig.action=="BUY" else mt5.ORDER_TYPE_SELL
