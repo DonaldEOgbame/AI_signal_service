@@ -4,12 +4,12 @@ import asyncio
 import logging
 import uuid
 import re
-import base64
 from datetime import datetime, timedelta
 
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 from django.conf import settings
+from cryptography.fernet import Fernet
 
 from telethon import TelegramClient, events, Button, utils
 from telethon.tl.types import MessageMediaPhoto
@@ -25,6 +25,7 @@ from googletrans import Translator
 from django.db.models import Sum, Avg, F, ExpressionWrapper, DurationField
 
 from core.ui import EMOJI, color_text
+from core.execution import execute_order
 
 from core.models import (
     TelegramUser, Subscription, TelegramSource, RawMessage, Signal,
@@ -35,6 +36,8 @@ from core.models import (
 logger = logging.getLogger(__name__)
 
 translator = Translator()
+
+fernet = Fernet(settings.MT5_ENC_KEY.encode())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # ENV VARS & Constants
@@ -81,15 +84,13 @@ client = TelegramClient('session', API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 async def send(user_id, text, buttons=None):
     """Send DM to a user with optional inline buttons."""
     await client.send_message(user_id, text, buttons=buttons or [])
-
-
 def encrypt(text: str) -> str:
-    return base64.b64encode(text.encode()).decode()
+    return fernet.encrypt(text.encode()).decode()
 
 
 def decrypt(text: str) -> str:
     try:
-        return base64.b64decode(text.encode()).decode()
+        return fernet.decrypt(text.encode()).decode()
     except Exception:
         return text
 
@@ -199,6 +200,23 @@ def compute_atr(symbol, periods=14):
         tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
         trs.append(tr)
     return sum(trs) / len(trs)
+
+
+def build_request(sig, size):
+    """Build MT5 order request without price."""
+    return {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": sig.asset,
+        "volume": size,
+        "type": mt5.ORDER_TYPE_BUY if sig.action == "BUY" else mt5.ORDER_TYPE_SELL,
+        "sl": sig.stop_loss,
+        "tp": sig.target_prices[0] if sig.target_prices else 0,
+        "deviation": 10,
+        "magic": 234000,
+        "comment": f"SignalBot {sig.id}",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
 
 def init_paystack_checkout(user):
     sub = user.subscription
@@ -698,10 +716,18 @@ async def legacy_all_message(evt):
         f"Mode: {sub.mode.title()}"
     )
     await send(u.telegram_id, card, buttons)
-    # auto-exec if aggressive
+    req = build_request(sig, size)
     if sub.mode=='aggressive':
-        await handle_execution(u, sig, size, sub)
-    mt5.shutdown()
+        mt5.shutdown()
+        ret, comment = await execute_order(u, sig, size, req)
+        msg = (
+            f"{EMOJI['check']} Order Executed: {sig.asset} {sig.action}"
+            if ret == mt5.TRADE_RETCODE_DONE
+            else f"{EMOJI['red']} Order Failed: {comment}"
+        )
+        await send(u.telegram_id, msg)
+    else:
+        mt5.shutdown()
 
 
 @client.on(events.NewMessage(func=lambda e: e.is_group or e.is_channel))
@@ -847,8 +873,16 @@ async def all_message(evt):
                     await send(u.telegram_id, f"{EMOJI['volatility']}{EMOJI['warning']} Volatility high. Force trade?", btns)
                     continue
             await send(u.telegram_id, card + f"\nSize: {size:.4f}", buttons)
+            req = build_request(sig, size)
             if sub.mode == 'aggressive':
-                await handle_execution(u, sig, size, sub)
+                mt5.shutdown()
+                ret, comment = await execute_order(u, sig, size, req)
+                msg = (
+                    f"{EMOJI['check']} Order Executed: {sig.asset} {sig.action}"
+                    if ret == mt5.TRADE_RETCODE_DONE
+                    else f"{EMOJI['red']} Order Failed: {comment}"
+                )
+                await send(u.telegram_id, msg)
         finally:
             mt5.shutdown()
     if src.last_quality < 0.1:
@@ -872,9 +906,13 @@ async def callback(evt):
         if action == 'approve':
             if init_mt5(sub):
                 size = calculate_size(sub, sig.entry_price, sig.stop_loss)
-                await handle_execution(u, sig, size, sub)
+                req = build_request(sig, size)
                 mt5.shutdown()
-                await evt.answer('Order approved & placed.')
+                ret, comment = await execute_order(u, sig, size, req)
+                if ret == mt5.TRADE_RETCODE_DONE:
+                    await evt.answer('Order approved & placed.')
+                else:
+                    await evt.answer(f'Order failed: {comment}')
             else:
                 await evt.answer('MT5 connection failed.')
         elif action == 'reject':
@@ -910,60 +948,21 @@ async def callback(evt):
             user = TelegramUser.objects.get(telegram_id=int(uid_str))
             sub = Subscription.objects.get(user=user)
             if init_mt5(sub):
-                await handle_execution(user, sig, size, sub)
+                req = build_request(sig, size)
                 mt5.shutdown()
+                ret, comment = await execute_order(user, sig, size, req)
+                msg = (
+                    f"{EMOJI['check']} Order Executed: {sig.asset} {sig.action}"
+                    if ret == mt5.TRADE_RETCODE_DONE
+                    else f"{EMOJI['red']} Order Failed: {comment}"
+                )
+                await send(user.telegram_id, msg)
         await evt.answer('Order forced.')
     elif action == 'skip' and ident:
         sig_id, uid_str = ident.split(':')
         pending_force.pop((int(uid_str), sig_id), None)
         await evt.answer('Trade skipped.')
 
-async def handle_execution(user, sig, size, sub):
-    # MT5 order logic
-    slippage = 0.0
-    order_type = mt5.ORDER_TYPE_BUY if sig.action=="BUY" else mt5.ORDER_TYPE_SELL
-    price = mt5.symbol_info_tick(sig.asset).ask if sig.action=="BUY" else mt5.symbol_info_tick(sig.asset).bid
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": sig.asset,
-        "volume": size,
-        "type": order_type,
-        "price": price,
-        "sl": sig.stop_loss,
-        "tp": sig.target_prices[0] if sig.target_prices else 0,
-        "deviation": 10,
-        "magic": 234000,
-        "comment": f"SignalBot {sig.id}",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    result = mt5.order_send(req)
-    to = datetime.now()
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        status="FAILED"
-        err = result.comment
-    else:
-        status="EXECUTED"
-        err = ""
-    to2 = datetime.now()
-    totd = int((to2-to).total_seconds()*1000)
-    tobj = TradeOrder.objects.create(
-        user=user, signal=sig, size=size,
-        status=status, placed_at=to,
-        executed_at=to2, actual_slippage=slippage,
-        profit_loss=0.0
-    )
-    ExecutionAttempt.objects.create(
-        trade_order=tobj, attempt_number=1,
-        request_payload=req, response_data=result._asdict(),
-        duration_ms=totd, success=(status=="EXECUTED"), error_message=err
-    )
-    msg = (
-        f"{EMOJI['check']} Order Executed: {sig.asset} {sig.action} {size:.2f} @{price}"
-        if status == "EXECUTED"
-        else f"{EMOJI['red']} Order Failed: {err}"
-    )
-    await send(user.telegram_id, msg)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # RUNBOT COMMAND
