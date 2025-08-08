@@ -148,14 +148,6 @@ GOOGLE_APPLICATION_CREDENTIALS = config('GOOGLE_APPLICATION_CREDENTIALS')
 OPENAI_API_KEY               = config('OPENAI_API_KEY')
 
 # ──────────────────────────────────────────────────────────────────────────────
-# MetaTrader5 Credentials
-# ──────────────────────────────────────────────────────────────────────────────
-
-MT5_SERVER   = config('MT5_SERVER')
-MT5_LOGIN    = config('MT5_LOGIN', cast=int)
-MT5_PASSWORD = config('MT5_PASSWORD')
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Bot & Scheduler Defaults
 # ──────────────────────────────────────────────────────────────────────────────
 

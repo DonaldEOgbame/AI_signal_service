@@ -89,7 +89,7 @@ def health(request):
     status = {
         "db":          "ok",
         "paystack_ok": bool(os.getenv("PAYSTACK_SECRET_KEY")),
-        "mt5_ok":      bool(os.getenv("MT5_SERVER") and os.getenv("MT5_LOGIN") and os.getenv("MT5_PASSWORD")),
+        "mt5_ok":      Subscription.objects.filter(mt5_server__gt="", mt5_login__gt="", mt5_password__gt="").exists(),
         "vision_ok":   bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS")),
         "openai_ok":   bool(os.getenv("OPENAI_API_KEY")),
     }
