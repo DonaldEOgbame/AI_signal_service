@@ -11,7 +11,9 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from decouple import config, Csv
+import dj_database_url
 from pathlib import Path
+from cryptography.fernet import Fernet
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -72,13 +74,9 @@ WSGI_APPLICATION = 'AI_service.wsgi.application'
 
 
 # Database
-# https://docs.djangoproject.com/en/5.2/ref/settings/#databases
-
+# Use DATABASE_URL if provided, defaulting to local SQLite
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
-    }
+    'default': dj_database_url.config(default=f'sqlite:///{BASE_DIR / "db.sqlite3"}')
 }
 
 
@@ -117,6 +115,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
@@ -155,3 +154,10 @@ BOT_PAUSED    = False
 TRIAL_DAYS    = config('TRIAL_DAYS', default=7, cast=int)
 GRACE_HOURS   = config('GRACE_HOURS', default=24, cast=int)
 MAX_MSG_RATE  = config('MAX_MSG_RATE', default=30.0, cast=float)
+
+# Optional external MT5 executor
+EXECUTOR_URL   = config('EXECUTOR_URL', default=None)
+EXECUTOR_TOKEN = config('EXECUTOR_TOKEN', default=None)
+
+# Encryption key for MT5 credentials (Fernet)
+MT5_ENC_KEY = config('MT5_ENC_KEY', default=Fernet.generate_key().decode())

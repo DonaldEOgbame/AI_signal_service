@@ -1,0 +1,12 @@
+Django
+gunicorn
+python-decouple
+dj-database-url
+telethon
+google-cloud-vision
+openai
+apscheduler
+requests
+cryptography
+MetaTrader5
+Pillow
